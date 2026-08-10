@@ -1,9 +1,27 @@
 import os
 import re
+import sys
 import threading
 import time
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
+
+# Fix Windows high-DPI scaling mismatches: without this, Tk/CTk can render
+# text mis-measured against the OS's actual scaling factor, which shows up
+# as clipped, overlapping, or "garbled" looking labels/buttons (e.g. a
+# percentage label rendering as "1009" instead of "100%", or button text
+# getting cut off) especially on 125%/150% display scaling. This must run
+# before any Tk window is created.
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # UI Styling Defaults
 ctk.set_appearance_mode("Dark")
@@ -12,38 +30,25 @@ ctk.set_default_color_theme("blue")
 
 class LapdoctorGUI(ctk.CTk):
 
+    APP_VERSION = "1.0.0"
+    APP_LICENSE = "MIT License"
+
     def __init__(self):
         super().__init__()
 
         self.title("LapDoctor - Smart System Health Assistant")
-        self.geometry("1100x750")
-        self.minsize(1000, 680)
+        self.geometry("1150x780")
+        self.minsize(1050, 700)
 
-        # Theme Palettes: same layout/design language, only the surface &
-        # text tones swap between Dark/Light. Accent + status colors are kept
-        # brand-consistent across both themes on purpose.
-        self.PALETTES = {
-            "Dark": {
-                "bg": "#121214", "card": "#1E1E22", "sidebar": "#18181B",
-                "surface2": "#27272A", "surface3": "#20202A", "hover2": "#3F3F46",
-                "text": "#F4F4F5", "muted": "#A1A1AA", "muted2": "#52525B",
-            },
-            "Light": {
-                "bg": "#F1F5F9", "card": "#FFFFFF", "sidebar": "#E4E4E7",
-                "surface2": "#E5E7EB", "surface3": "#ECECF1", "hover2": "#D4D4D8",
-                "text": "#18181B", "muted": "#52525B", "muted2": "#71717A",
-            },
-        }
-        self.current_theme = "Dark"
-
-        # Color Palette (populated from PALETTES; kept as plain attributes so
-        # every existing widget-creation call site is unchanged)
-        self.BG_DARK = self.PALETTES["Dark"]["bg"]
-        self.CARD_BG = self.PALETTES["Dark"]["card"]
-        self.SIDEBAR_BG = self.PALETTES["Dark"]["sidebar"]
-        self.PRIMARY_ACCENT = "#38BDF8"  # Cyan/Blue - constant brand accent
-        self.TEXT_COLOR = self.PALETTES["Dark"]["text"]
-        self.TEXT_MUTED = self.PALETTES["Dark"]["muted"]
+        # Color Palette - Dark only (theme switching removed: it broke
+        # contrast/readability across the app, so LapDoctor now ships a
+        # single, polished Dark theme).
+        self.BG_DARK = "#121214"
+        self.CARD_BG = "#1E1E22"
+        self.SIDEBAR_BG = "#18181B"
+        self.PRIMARY_ACCENT = "#38BDF8"  # Cyan/Blue
+        self.TEXT_COLOR = "#F4F4F5"
+        self.TEXT_MUTED = "#A1A1AA"
 
         self.configure(fg_color=self.BG_DARK)
 
@@ -55,6 +60,16 @@ class LapdoctorGUI(ctk.CTk):
         self.live_stats = {"cpu": 0, "ram": 0, "disk": 0, "storage": 0}
         self.scan_stop_event = threading.Event()
         self.scan_progress = 0
+        self._last_progress_ui_ts = 0.0
+
+        # Per-scan-type console logs, kept separate so switching between
+        # Duplicates / Large Files / Old Files / App Caches shows only that
+        # mode's own last result instead of one shared, mixed log.
+        self.scan_logs = {"duplicates": "", "large": "", "old": "", "apps": ""}
+
+        # Smart Cleaning alerting state
+        self.smart_cleaning_var = None  # set once the Settings page builds it
+        self._last_smart_alert_ts = 0.0
 
         # Grid Layout
         self.grid_columnconfigure(1, weight=1)
@@ -74,6 +89,7 @@ class LapdoctorGUI(ctk.CTk):
         # Hardware Monitoring Thread
         self.monitoring = True
         threading.Thread(target=self.update_system_stats, daemon=True).start()
+        threading.Thread(target=self._smart_cleaning_loop, daemon=True).start()
 
     def load_backend_modules(self):
         try:
@@ -115,7 +131,6 @@ class LapdoctorGUI(ctk.CTk):
             )
             self.history_conn.commit()
         except Exception as exc:
-            self.log_text = None
             self.history_conn = None
             self.history_error = str(exc)
 
@@ -147,54 +162,131 @@ class LapdoctorGUI(ctk.CTk):
                 ORDER BY id DESC
                 """
             ).fetchall()
-            if getattr(self, "history_txt", None):
-                self.history_txt.delete("1.0", "end")
-                if not rows:
-                    self.history_txt.insert("end", "[System Initialized]: No scan history available yet.\n")
-                    if hasattr(self, "last_scan_label"):
-                        self.last_scan_label.configure(text="Last scanned: none")
-                    if hasattr(self, "last_deleted_label"):
-                        self.last_deleted_label.configure(text="Last deleted: none")
-                    return
 
-                latest_scan = rows[0]
-                scan_type, target_path, scanned_at, status = latest_scan[1], latest_scan[2], latest_scan[3], latest_scan[4]
+            if not getattr(self, "history_scroll", None):
+                return
+
+            for child in self.history_scroll.winfo_children():
+                child.destroy()
+
+            if not rows:
                 if hasattr(self, "last_scan_label"):
-                    self.last_scan_label.configure(
-                        text=f"Last scanned: {scan_type.upper()} on {target_path} at {scanned_at} ({status})"
-                    )
-
-                last_deleted = next((row for row in rows if row[4] == "deleted"), None)
-                if last_deleted and hasattr(self, "last_deleted_label"):
-                    deleted_files = last_deleted[6] or ""
-                    deleted_count = last_deleted[5]
-                    deleted_size_mb = last_deleted[7] or 0
-                    self.last_deleted_label.configure(
-                        text=f"Last deleted: {deleted_count} files | {deleted_size_mb:.2f} MB | {deleted_files}"
-                    )
-                elif hasattr(self, "last_deleted_label"):
+                    self.last_scan_label.configure(text="Last scanned: none")
+                if hasattr(self, "last_deleted_label"):
                     self.last_deleted_label.configure(text="Last deleted: none")
+                ctk.CTkLabel(
+                    self.history_scroll,
+                    text="No scan history yet. Run a scan from Storage Scan to see it here.",
+                    font=ctk.CTkFont(size=12),
+                    text_color=self.TEXT_MUTED,
+                ).pack(anchor="w", padx=10, pady=20)
+                return
 
-                self.history_txt.insert("end", "Scan & Cleanup History\n")
-                for row in rows:
-                    scan_type, target_path, scanned_at, status, deleted_count, deleted_files = row[1], row[2], row[3], row[4], row[5], row[6]
-                    deleted = deleted_files or ""
-                    self.history_txt.insert(
-                        "end",
-                        f"[{scanned_at}] Scan Type: {scan_type.upper()} | Target: {target_path} | Status: {status} | Deleted: {deleted_count} | Files: {deleted}\n",
-                    )
+            latest_scan = rows[0]
+            scan_type, target_path, scanned_at, status = latest_scan[1], latest_scan[2], latest_scan[3], latest_scan[4]
+            if hasattr(self, "last_scan_label"):
+                self.last_scan_label.configure(
+                    text=f"Last scanned: {scan_type.upper()} on {target_path} at {scanned_at} ({status})"
+                )
+
+            last_deleted = next((row for row in rows if row[4] == "deleted"), None)
+            if last_deleted and hasattr(self, "last_deleted_label"):
+                deleted_files = last_deleted[6] or ""
+                deleted_count = last_deleted[5]
+                deleted_size_mb = last_deleted[7] or 0
+                self.last_deleted_label.configure(
+                    text=f"Last deleted: {deleted_count} files | {deleted_size_mb:.2f} MB"
+                )
+            elif hasattr(self, "last_deleted_label"):
+                self.last_deleted_label.configure(text="Last deleted: none")
+
+            type_icons = {"duplicates": "🗂️", "large": "📦", "old": "🕒", "apps": "🧹"}
+            status_style = {
+                "completed": ("#22C55E", "COMPLETED"),
+                "in_progress": ("#38BDF8", "IN PROGRESS"),
+                "stopped": ("#F59E0B", "STOPPED"),
+                "deleted": ("#EF4444", "FILES CLEANED"),
+                "error": ("#EF4444", "ERROR"),
+            }
+
+            for row in rows:
+                rid, scan_type, target_path, scanned_at, status, deleted_count, deleted_files, deleted_size_mb = row
+                color, status_label = status_style.get(status, ("#A1A1AA", status.upper()))
+
+                card = ctk.CTkFrame(self.history_scroll, fg_color="#18181B", corner_radius=8)
+                card.pack(fill="x", pady=5, padx=2)
+
+                top_row = ctk.CTkFrame(card, fg_color="transparent")
+                top_row.pack(fill="x", padx=14, pady=(10, 2))
+
+                icon = type_icons.get(scan_type, "🔍")
+                ctk.CTkLabel(
+                    top_row,
+                    text=f"{icon}  {scan_type.upper()} SCAN",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                    text_color=self.TEXT_COLOR,
+                    anchor="w",
+                ).pack(side="left")
+
+                badge = ctk.CTkLabel(
+                    top_row,
+                    text=status_label,
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    text_color="#FFFFFF",
+                    fg_color=color,
+                    corner_radius=6,
+                    padx=8,
+                    pady=2,
+                )
+                badge.pack(side="right")
+
+                ctk.CTkLabel(
+                    card,
+                    text=f"📁 {target_path}",
+                    font=ctk.CTkFont(size=11),
+                    text_color=self.TEXT_MUTED,
+                    anchor="w",
+                    justify="left",
+                    wraplength=900,
+                ).pack(fill="x", padx=14, pady=(0, 2))
+
+                bottom_row = ctk.CTkFrame(card, fg_color="transparent")
+                bottom_row.pack(fill="x", padx=14, pady=(0, 10))
+
+                ctk.CTkLabel(
+                    bottom_row,
+                    text=f"🕓 {scanned_at}",
+                    font=ctk.CTkFont(size=10),
+                    text_color=self.TEXT_MUTED,
+                ).pack(side="left")
+
+                if status == "deleted" and deleted_count:
+                    ctk.CTkLabel(
+                        bottom_row,
+                        text=f"🗑 {deleted_count} files removed · {deleted_size_mb:.2f} MB freed",
+                        font=ctk.CTkFont(size=10, weight="bold"),
+                        text_color="#EF4444",
+                    ).pack(side="right")
+
         except Exception as exc:
-            if getattr(self, "history_txt", None):
-                self.history_txt.insert("end", f"[History Load Error]: {exc}\n")
+            if getattr(self, "history_scroll", None):
+                for child in self.history_scroll.winfo_children():
+                    child.destroy()
+                ctk.CTkLabel(
+                    self.history_scroll,
+                    text=f"[History Load Error]: {exc}",
+                    text_color="#EF4444",
+                ).pack(anchor="w", padx=10, pady=10)
 
     # -------------------------------------------------------------
     # Navigation & Layout
     # -------------------------------------------------------------
     def create_sidebar(self):
         self.sidebar = ctk.CTkFrame(
-            self, width=220, corner_radius=0, fg_color=self.SIDEBAR_BG
+            self, width=240, corner_radius=0, fg_color=self.SIDEBAR_BG
         )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
 
         brand_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         brand_frame.pack(fill="x", padx=15, pady=(20, 25))
@@ -213,6 +305,8 @@ class LapdoctorGUI(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=self.TEXT_MUTED,
             anchor="w",
+            wraplength=205,
+            justify="left",
         ).pack(fill="x")
 
         self.nav_btns = {}
@@ -677,14 +771,20 @@ class LapdoctorGUI(ctk.CTk):
             ("App Caches", "apps"),
         ]
 
+        # Radios live in their own sub-frame so they can shrink/wrap without
+        # squeezing the scan button off-screen at narrower window widths.
+        radios_frame = ctk.CTkFrame(mode_frame, fg_color="transparent")
+        radios_frame.pack(side="left", fill="x", expand=True)
+
         for text, m_id in modes:
             rb = ctk.CTkRadioButton(
-                mode_frame,
+                radios_frame,
                 text=text,
                 value=m_id,
                 variable=self.scan_type,
                 font=ctk.CTkFont(size=12, weight="bold"),
                 fg_color=self.PRIMARY_ACCENT,
+                command=self._on_scan_mode_changed,
             )
             rb.pack(side="left", padx=(0, 15))
 
@@ -695,6 +795,7 @@ class LapdoctorGUI(ctk.CTk):
             fg_color=self.PRIMARY_ACCENT,
             text_color="#000000",
             hover_color="#0284C7",
+            width=190,
             command=self.toggle_scan,
         )
         self.scan_btn.pack(side="right")
@@ -707,16 +808,22 @@ class LapdoctorGUI(ctk.CTk):
             text="🔍 Storage Analysis: Awaiting Scan...",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=self.PRIMARY_ACCENT,
+            anchor="w",
+            justify="left",
+            wraplength=980,
         )
-        self.analysis_title.pack(anchor="w", padx=15, pady=10)
+        self.analysis_title.pack(anchor="w", fill="x", padx=15, pady=10)
 
         self.scan_status = ctk.CTkLabel(
             self.analysis_card,
             text="Idle",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=self.TEXT_MUTED,
+            anchor="w",
+            justify="left",
+            wraplength=980,
         )
-        self.scan_status.pack(anchor="w", padx=15, pady=(0, 4))
+        self.scan_status.pack(anchor="w", fill="x", padx=15, pady=(0, 4))
 
         self.scan_progress_bar = ctk.CTkProgressBar(
             self.analysis_card,
@@ -771,15 +878,39 @@ class LapdoctorGUI(ctk.CTk):
         self.scroll_files = ctk.CTkScrollableFrame(self.tab_files, fg_color=self.CARD_BG)
         self.scroll_files.grid(row=1, column=0, sticky="nsew")
 
-        self.tab_console.grid_rowconfigure(0, weight=1)
+        self.tab_console.grid_rowconfigure(1, weight=1)
         self.tab_console.grid_columnconfigure(0, weight=1)
+
+        self.console_mode_lbl = ctk.CTkLabel(
+            self.tab_console,
+            text="Showing results for: DUPLICATES",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=self.PRIMARY_ACCENT,
+            anchor="w",
+        )
+        self.console_mode_lbl.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 4))
 
         self.log_text = ctk.CTkTextbox(
             self.tab_console,
             font=ctk.CTkFont(family="Consolas", size=12),
             fg_color=self.CARD_BG,
         )
-        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self._refresh_console()
+
+    def _on_scan_mode_changed(self):
+        """Each scan mode keeps its own console output; switching modes just
+        displays that mode's last result instead of a single mixed log."""
+        self._refresh_console()
+
+    def _refresh_console(self):
+        mode = self.scan_type.get()
+        if hasattr(self, "console_mode_lbl"):
+            self.console_mode_lbl.configure(text=f"Showing results for: {mode.upper()}")
+        content = self.scan_logs.get(mode) or f"No {mode} scan has been run yet. Click START SCAN & ANALYZE to run one."
+        if getattr(self, "log_text", None):
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("end", content)
 
     # -------------------------------------------------------------
     # Risk Classification & File Recommendation Generator
@@ -897,6 +1028,7 @@ class LapdoctorGUI(ctk.CTk):
         page = ctk.CTkFrame(self.main_container, fg_color=self.CARD_BG)
         self.pages["history"] = page
         page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(2, weight=1)
 
         ctk.CTkLabel(
             page,
@@ -912,65 +1044,45 @@ class LapdoctorGUI(ctk.CTk):
             text="Last scanned: none",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=self.TEXT_COLOR,
+            anchor="w",
+            justify="left",
+            wraplength=900,
         )
-        self.last_scan_label.pack(anchor="w", padx=15, pady=(10, 3))
+        self.last_scan_label.pack(anchor="w", fill="x", padx=15, pady=(10, 3))
 
         self.last_deleted_label = ctk.CTkLabel(
             summary,
             text="Last deleted: none",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=self.TEXT_COLOR,
+            anchor="w",
         )
         self.last_deleted_label.pack(anchor="w", padx=15, pady=(3, 10))
 
-        self.history_txt = ctk.CTkTextbox(
-            page,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            fg_color="#121214",
-        )
-        self.history_txt.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self.history_txt.insert(
-            "end", "[System Initialized]: Waiting for user-approved cleanup tasks.\n"
-        )
+        self.history_scroll = ctk.CTkScrollableFrame(page, fg_color="#121214")
+        self.history_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        ctk.CTkLabel(
+            self.history_scroll,
+            text="Waiting for scans...",
+            font=ctk.CTkFont(size=12),
+            text_color=self.TEXT_MUTED,
+        ).pack(anchor="w", padx=10, pady=20)
 
     def create_settings_page(self):
         page = ctk.CTkFrame(self.main_container, fg_color=self.CARD_BG)
         self.pages["settings"] = page
 
+        scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+
+        # ---------------- Preferences ----------------
         ctk.CTkLabel(
-            page, text="Preferences", font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(anchor="w", padx=20, pady=15)
+            scroll, text="Preferences", font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(15, 8))
 
-        theme_frame = ctk.CTkFrame(page, fg_color="transparent")
-        theme_frame.pack(fill="x", padx=20, pady=10)
-
-        ctk.CTkLabel(
-            theme_frame,
-            text="Appearance Theme Mode:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).pack(side="left", padx=(0, 10))
-
-        theme_menu = ctk.CTkOptionMenu(
-            theme_frame,
-            values=["Dark", "Light"],
-            command=self.apply_theme,
-            fg_color="#27272A",
-            button_color="#3F3F46",
-        )
-        theme_menu.set(self.current_theme)
-        theme_menu.pack(side="left")
-        self.theme_menu = theme_menu
-
-        self.theme_status_lbl = ctk.CTkLabel(
-            theme_frame,
-            text="",
-            font=ctk.CTkFont(size=11),
-            text_color=self.TEXT_MUTED,
-        )
-        self.theme_status_lbl.pack(side="left", padx=(12, 0))
-
-        exclude_frame = ctk.CTkFrame(page, fg_color="transparent")
-        exclude_frame.pack(fill="x", padx=20, pady=10)
+        exclude_frame = ctk.CTkFrame(scroll, fg_color="#20202A", corner_radius=10)
+        exclude_frame.pack(fill="x", padx=20, pady=(0, 18))
 
         self.skip_system_dirs_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
@@ -979,7 +1091,7 @@ class LapdoctorGUI(ctk.CTk):
             variable=self.skip_system_dirs_var,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=self.PRIMARY_ACCENT,
-        ).pack(anchor="w")
+        ).pack(anchor="w", padx=15, pady=(15, 0))
 
         ctk.CTkLabel(
             exclude_frame,
@@ -987,68 +1099,165 @@ class LapdoctorGUI(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color=self.TEXT_MUTED,
             justify="left",
+        ).pack(anchor="w", padx=15, pady=(4, 15))
+
+        # ---------------- Smart Cleaning ----------------
+        ctk.CTkLabel(
+            scroll, text="Smart Cleaning", font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        smart_frame = ctk.CTkFrame(scroll, fg_color="#20202A", corner_radius=10)
+        smart_frame.pack(fill="x", padx=20, pady=(0, 18))
+
+        smart_row = ctk.CTkFrame(smart_frame, fg_color="transparent")
+        smart_row.pack(fill="x", padx=15, pady=(15, 0))
+
+        self.smart_cleaning_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            smart_row,
+            text="Alert me when junk files or browser data should be cleaned",
+            variable=self.smart_cleaning_var,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            progress_color=self.PRIMARY_ACCENT,
+            command=self._on_smart_cleaning_toggled,
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            smart_frame,
+            text="Runs a lightweight check in the background using your real disk usage and\nDownloads-folder junk (.tmp/.log/.bak/.old/.dmp/.chk) size, and shows a\npop-up alert when storage or junk builds up. No files are touched automatically.",
+            font=ctk.CTkFont(size=11),
+            text_color=self.TEXT_MUTED,
+            justify="left",
+        ).pack(anchor="w", padx=15, pady=(6, 0))
+
+        self.smart_cleaning_status_lbl = ctk.CTkLabel(
+            smart_frame,
+            text="Status: Off",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=self.TEXT_MUTED,
+        )
+        self.smart_cleaning_status_lbl.pack(anchor="w", padx=15, pady=(8, 15))
+
+        # ---------------- About ----------------
+        ctk.CTkLabel(
+            scroll, text="About", font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        about_frame = ctk.CTkFrame(scroll, fg_color="#20202A", corner_radius=10)
+        about_frame.pack(fill="x", padx=20, pady=(0, 20))
+
+        ctk.CTkLabel(
+            about_frame,
+            text="🩺 LapDoctor — Smart System Health Assistant",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=self.TEXT_COLOR,
+        ).pack(anchor="w", padx=15, pady=(15, 2))
+
+        ctk.CTkLabel(
+            about_frame,
+            text=f"Version {self.APP_VERSION}",
+            font=ctk.CTkFont(size=12),
+            text_color=self.TEXT_MUTED,
+        ).pack(anchor="w", padx=15)
+
+        ctk.CTkLabel(
+            about_frame,
+            text=f"License: {self.APP_LICENSE}",
+            font=ctk.CTkFont(size=12),
+            text_color=self.TEXT_MUTED,
+        ).pack(anchor="w", padx=15, pady=(2, 0))
+
+        ctk.CTkLabel(
+            about_frame,
+            text="A local, privacy-first tool that scans your own machine for duplicate,\nlarge, stale, and cache files and lets you review and clean them safely.\nNothing is uploaded off your device.",
+            font=ctk.CTkFont(size=11),
+            text_color=self.TEXT_MUTED,
+            justify="left",
+        ).pack(anchor="w", padx=15, pady=(8, 10))
+
+        support_row = ctk.CTkFrame(about_frame, fg_color="transparent")
+        support_row.pack(anchor="w", padx=15, pady=(0, 15))
+
+        ctk.CTkLabel(
+            support_row,
+            text="Need help or found a bug?",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=self.TEXT_COLOR,
+        ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            support_row,
+            text="✉  support@lapdoctor.app     •     🐙 github.com/lapdoctor/issues",
+            font=ctk.CTkFont(size=11),
+            text_color=self.PRIMARY_ACCENT,
         ).pack(anchor="w", pady=(4, 0))
 
     # -------------------------------------------------------------
-    # Theme Engine
+    # Smart Cleaning Alerts
     # -------------------------------------------------------------
-    def apply_theme(self, mode):
-        """Actually applies the selected theme.
+    def _on_smart_cleaning_toggled(self):
+        enabled = self.smart_cleaning_var.get()
+        if hasattr(self, "smart_cleaning_status_lbl"):
+            text = "Status: On — checking in the background" if enabled else "Status: Off"
+            color = "#22C55E" if enabled else self.TEXT_MUTED
+            self.smart_cleaning_status_lbl.configure(text=text, text_color=color)
+        if enabled:
+            self._last_smart_alert_ts = 0.0  # allow an alert soon if conditions are already met
 
-        Rather than requiring every widget-creation call site to be rewritten,
-        this walks the live widget tree and swaps any color that matches the
-        *previous* palette for its equivalent tone in the *new* palette. Status
-        colors (red/green/amber badges) and the brand accent are intentionally
-        left untouched, so the layout/design stays exactly the same -- only the
-        light/dark surface & text tones change.
-        """
-        if mode not in self.PALETTES or mode == self.current_theme:
-            return
-
-        old_palette = self.PALETTES[self.current_theme]
-        new_palette = self.PALETTES[mode]
-        color_map = {
-            old_palette[key]: new_palette[key]
-            for key in old_palette
-            if old_palette[key] != new_palette[key]
-        }
-
-        self.current_theme = mode
-        ctk.set_appearance_mode(mode)
-
-        self.BG_DARK = new_palette["bg"]
-        self.CARD_BG = new_palette["card"]
-        self.SIDEBAR_BG = new_palette["sidebar"]
-        self.TEXT_COLOR = new_palette["text"]
-        self.TEXT_MUTED = new_palette["muted"]
-
-        self._retheme_widget(self, color_map)
-        self.configure(fg_color=self.BG_DARK)
-
-        if hasattr(self, "theme_status_lbl"):
-            self.theme_status_lbl.configure(text=f"✓ {mode} theme applied")
-        if hasattr(self, "log"):
-            self.log(f"[Settings]: Appearance theme switched to {mode}.")
-
-    def _retheme_widget(self, widget, color_map):
-        for attr in ("fg_color", "text_color", "border_color", "button_color",
-                     "segmented_button_fg_color", "segmented_button_unselected_color"):
-            try:
-                current = widget.cget(attr)
-            except Exception:
-                continue
-            if isinstance(current, str) and current in color_map:
-                try:
-                    widget.configure(**{attr: color_map[current]})
-                except Exception:
-                    pass
-
+    def _estimate_junk_mb(self, folder, max_files=20000):
+        """Cheap, real (not simulated) estimate of reclaimable junk: walks a
+        folder checking only extensions + sizes, no hashing, so it's fast
+        enough to run periodically in the background."""
+        junk_ext = {".tmp", ".log", ".bak", ".old", ".dmp", ".chk", ".crdownload", ".part"}
+        total = 0
+        checked = 0
         try:
-            children = widget.winfo_children()
-        except Exception:
-            children = []
-        for child in children:
-            self._retheme_widget(child, color_map)
+            for root, dirs, files in os.walk(folder):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in junk_ext:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                        except OSError:
+                            pass
+                    checked += 1
+                    if checked >= max_files:
+                        return total / (1024 * 1024)
+        except OSError:
+            pass
+        return total / (1024 * 1024)
+
+    def _smart_cleaning_loop(self):
+        """Background loop: real disk-usage + real junk-file estimate,
+        surfaced as an actual pop-up alert (not a static/fake toggle)."""
+        while self.monitoring:
+            try:
+                if self.smart_cleaning_var is not None and self.smart_cleaning_var.get():
+                    now = time.time()
+                    if now - self._last_smart_alert_ts > 900:  # don't nag more than every 15 min
+                        storage_pct = self.live_stats.get("storage", 0)
+                        downloads = os.path.expanduser("~/Downloads")
+                        junk_mb = self._estimate_junk_mb(downloads) if os.path.isdir(downloads) else 0
+
+                        if storage_pct >= 85:
+                            self._last_smart_alert_ts = now
+                            self.after(0, lambda p=storage_pct: self._raise_smart_alert(
+                                f"Your storage is {p:.0f}% full. Running a Duplicates or Old Files scan could free up space."
+                            ))
+                        elif junk_mb >= 200:
+                            self._last_smart_alert_ts = now
+                            self.after(0, lambda m=junk_mb: self._raise_smart_alert(
+                                f"Found ~{m:.0f} MB of junk files (.tmp/.log/.bak/.old) in your Downloads folder. Consider cleaning them."
+                            ))
+            except Exception:
+                pass
+            time.sleep(60)
+
+    def _raise_smart_alert(self, message):
+        if hasattr(self, "smart_cleaning_status_lbl"):
+            self.smart_cleaning_status_lbl.configure(
+                text=f"Status: On — {message}", text_color="#F59E0B"
+            )
+        messagebox.showwarning("Smart Cleaning Alert", message)
 
     def show_privacy_modal(self):
         modal = ctk.CTkToplevel(self)
@@ -1154,11 +1363,9 @@ class LapdoctorGUI(ctk.CTk):
             item["var"].set(False)
 
     def log(self, message):
-        self.after(0, lambda: self._append_log(message))
-
-    def _append_log(self, message):
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
+        """Kept for internal/error notices that aren't part of a scan's raw
+        results; no longer used for user-action chatter in the console."""
+        print(message)
 
     def _set_scan_progress_ui(self, value):
         self.scan_progress = max(0, min(100, int(value)))
@@ -1167,7 +1374,18 @@ class LapdoctorGUI(ctk.CTk):
 
     def _on_scan_progress(self, stage, done, total):
         """Real progress callback wired into core scanners (replaces the old
-        fake time-based animation with the scanner's actual work)."""
+        fake time-based animation with the scanner's actual work).
+
+        Time-throttled (max ~8 UI updates/sec) so a fast scan over many small
+        files doesn't flood the Tk event loop with widget updates -- that
+        flooding was the main cause of the app (and perceived system)
+        lagging/stuttering during a scan.
+        """
+        now = time.time()
+        if now - self._last_progress_ui_ts < 0.12:
+            return
+        self._last_progress_ui_ts = now
+
         stage_labels = {
             "discover": "Discovering files",
             "prefilter": "Pre-filtering candidates",
@@ -1193,7 +1411,6 @@ class LapdoctorGUI(ctk.CTk):
             self.stop_requested = True
             self.scan_stop_event.set()
             self.scan_status.configure(text="Stopping scan...")
-            self.log("[User Action]: Stop requested. The running scan is being interrupted.")
 
     def start_scan(self):
         target_path = self.path_entry.get().strip()
@@ -1203,6 +1420,8 @@ class LapdoctorGUI(ctk.CTk):
         if not os.path.exists(target_path):
             messagebox.showerror("Error", "Selected path does not exist!")
             return
+
+        mode = self.scan_type.get()
 
         self.is_scanning = True
         self.stop_requested = False
@@ -1218,20 +1437,21 @@ class LapdoctorGUI(ctk.CTk):
             item["frame"].destroy()
         self.detected_items.clear()
 
-        self.log(
-            f"=== Starting [{self.scan_type.get().upper()}] Scan on: {target_path} ==="
-        )
-        self.record_scan(self.scan_type.get(), target_path, "in_progress")
-        self.run_scanner_thread(target_path)
+        self.record_scan(mode, target_path, "in_progress")
+        self.run_scanner_thread(target_path, mode)
 
-    def run_scanner_thread(self, target_path):
+    def run_scanner_thread(self, target_path, mode):
         """Compatibility worker launcher for the requested UI contract."""
-        threading.Thread(target=self.execute_scan, args=(target_path,), daemon=True).start()
+        threading.Thread(target=self.execute_scan, args=(target_path, mode), daemon=True).start()
 
-    def execute_scan(self, path):
-        mode = self.scan_type.get()
+    def execute_scan(self, path, mode):
+        # ``mode`` is captured on the main thread by start_scan() and passed
+        # in explicitly, rather than read from the Tk StringVar here -- Tk
+        # variables aren't safe to read from a background thread, and reading
+        # it here could also race if the user flips the radio button mid-scan.
         raw_output = ""
         found_paths = []
+        console_text = ""
         skip_system_dirs = getattr(self, "skip_system_dirs_var", None)
         skip_system_dirs = skip_system_dirs.get() if skip_system_dirs else True
 
@@ -1258,17 +1478,25 @@ class LapdoctorGUI(ctk.CTk):
                 ))
 
             if not self.stop_requested:
-                self.log(self._summary_from_output(mode, raw_output, path))
-                found_paths = self._extract_scan_paths(raw_output)
+                found_paths = list(dict.fromkeys(self._extract_scan_paths(raw_output)))
+                # Duplicates keep the rich grouped report (Original/Duplicate
+                # per group); the other modes show a plain path list only, as
+                # requested -- the console's job is to show file paths, not
+                # a formatted report or user-action chatter.
+                if mode == "duplicates":
+                    console_text = raw_output.strip() or "No duplicate files found."
+                else:
+                    console_text = "\n".join(found_paths) if found_paths else raw_output.strip()
             else:
-                self.log(f"[Scan Interrupted] {mode} scan stopped on: {path}")
+                console_text = f"Scan interrupted by user on:\n{path}"
 
         except Exception as e:
-            self.log(f"[Scan Error]: {str(e)}")
+            console_text = f"[Scan Error]: {str(e)}"
         finally:
             self.is_scanning = False
             self.scan_stop_event.clear()
-            self.after(0, lambda: self.finish_scan(list(set(found_paths))))
+            self.scan_logs[mode] = console_text
+            self.after(0, lambda: self.finish_scan(found_paths, mode))
 
     def _extract_scan_paths(self, raw_output):
         output = str(raw_output or "")
@@ -1281,26 +1509,8 @@ class LapdoctorGUI(ctk.CTk):
                 found_paths.append(p)
         return found_paths
 
-    def _summary_from_output(self, mode, raw_output, path):
-        output = str(raw_output).strip()
-        if not output:
-            return f"[{mode.upper()}] Scan completed for {path} with no report rows."
-
-        first_line = output.splitlines()[0]
-        lower = output.lower()
-        if "found" in lower:
-            summary = []
-            for line in output.splitlines():
-                if line.strip().startswith("Found ") or line.strip().startswith("Total ") or "No " in line:
-                    summary.append(line.strip())
-                elif "Total" in line:
-                    summary.append(line.strip())
-            return f"[{mode.upper()}] Scan summary for {path}: " + " | ".join(summary[:3])
-
-        return f"[{mode.upper()}] Scan completed for {path}: {first_line}"
-
-    def finish_scan(self, paths):
-        scan_mode = self.scan_type.get()
+    def finish_scan(self, paths, scan_mode=None):
+        scan_mode = scan_mode or self.scan_type.get()
         was_stopped = self.stop_requested
         self.stop_requested = False
         self.scan_stop_event.clear()
@@ -1315,7 +1525,6 @@ class LapdoctorGUI(ctk.CTk):
         self._set_scan_progress_ui(self.scan_progress)
 
         if was_stopped:
-            self.log("\n=== Scan Stopped by User ===")
             self.record_scan(scan_mode, self.path_entry.get().strip(), "stopped")
         else:
             self.record_scan(scan_mode, self.path_entry.get().strip(), "completed")
@@ -1324,7 +1533,7 @@ class LapdoctorGUI(ctk.CTk):
             self.add_file_item(p)
 
         self.analyze_storage_reasons(paths)
-        self.log("\n=== Scan & Analysis Completed ===")
+        self._refresh_console()
         self.tabview.set("Recommended Files to Clean (User Approval Required)")
         self.refresh_history_page()
 
@@ -1347,7 +1556,6 @@ class LapdoctorGUI(ctk.CTk):
             try:
                 if self.cleanup and hasattr(self.cleanup, "execute"):
                     res = self.cleanup.execute(selected_files)
-                    self.log(str(res))
                     deleted_count = len(selected_files)
                     deleted_size_mb = sum(os.path.getsize(p) if os.path.exists(p) else 0 for p in selected_files) / (1024*1024)
                     self.record_scan(
@@ -1358,10 +1566,6 @@ class LapdoctorGUI(ctk.CTk):
                         deleted_count=deleted_count,
                         deleted_size_mb=deleted_size_mb,
                         note="cleanup-approved",
-                    )
-                    self.history_txt.insert(
-                        "end",
-                        f"[{time.strftime('%Y-%m-%d %H:%M')}] User Approved Deletion: {len(selected_files)} items cleaned.\n",
                     )
 
                 remaining = []
@@ -1374,7 +1578,7 @@ class LapdoctorGUI(ctk.CTk):
                 self.refresh_history_page()
                 messagebox.showinfo("Success", "Selected files cleaned safely!")
             except Exception as e:
-                self.log(f"[Cleanup Error]: {str(e)}")
+                messagebox.showerror("Cleanup Error", str(e))
 
 
 if __name__ == "__main__":

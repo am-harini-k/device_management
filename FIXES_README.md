@@ -1,53 +1,69 @@
-# LapDoctor — Fixes Applied
+# LapDoctor — Fixes Applied (Round 2)
 
-## 1. Duplicate scan freezing the GUI / whole laptop
-**Cause:** `core/duplicate.py` computed a full MD5 hash (reading the *entire*
-file) for every file that merely shared a size with another file. On a large
-or system-wide path this means reading huge amounts of data off disk, which
-saturates I/O and stalls the whole machine, not just the app.
+## 1. Theme switching removed
+It was breaking contrast/readability across the app (checkboxes disappearing,
+low-contrast text, etc). The app now ships **Dark theme only** — the Settings
+page no longer has a theme selector.
 
-**Fix:** `core/duplicate.py` now uses a 3-stage pipeline:
-1. Group by file size (free).
-2. Cheap **partial hash** — only reads the first + last 64 KB of each
-   same-size file — to rule out non-duplicates without full reads.
-3. Only files that collide on *both* size and partial hash get a full
-   MD5 hash.
+## 2. Settings page: About + Smart Cleaning added
+- **About**: app version, license, a short description, and support
+  contact/link.
+- **Smart Cleaning**: a real toggle (not decorative). When on, a background
+  thread checks your *actual* disk usage (via `psutil`) and does a cheap,
+  extension-based scan of your Downloads folder for junk files
+  (`.tmp/.log/.bak/.old/.dmp/.chk/...`) once a minute. If storage is ≥85% full
+  or estimated junk exceeds ~200 MB, it raises a real pop-up alert (throttled
+  to at most once every 15 minutes) telling you to run a cleanup scan. No
+  files are ever touched automatically.
 
-It also now skips known noisy/protected folders (`Windows`,
-`Program Files`, `$Recycle.Bin`, `System Volume Information`,
-`node_modules`, `.git`, ...) by default, yields control periodically so the
-OS/UI stay responsive, and reports real progress via a `progress_cb`
-callback instead of blocking silently. The same skip-list + progress
-pattern was applied to `large_files.py`, `old_files.py`, and
-`app_analyzer.py` for consistency.
+## 3. Scan Log Console fixed
+Previously the console mixed everything together: file paths, "stop
+requested" messages, start/complete banners, and cleanup results shared
+across every scan mode. Now:
+- The console only shows **scan results** (file paths / duplicate groups) —
+  user-action and status chatter now lives only in the status line above the
+  progress bar, not the console.
+- **Each scan mode (Duplicates / Large Files / Old Files / App Caches) has
+  its own separate console.** Switching the radio button switches which
+  mode's last result you're viewing — a small "Showing results for: X" label
+  confirms which one is displayed. Running a new scan for a mode replaces
+  only that mode's console, leaving the others untouched.
+- **Duplicates** console keeps the full grouped report — `[Group N] - File
+  Size: ...`, `Original (KEPT)` / `Duplicate (REMOVABLE)` lines, and a totals
+  footer — matching the format you asked for.
+- **Large Files / Old Files / App Caches** consoles now show a plain list of
+  file paths only, one per line.
 
-A new checkbox in **Settings** lets you turn the system-folder skip off if
-you deliberately want to scan those locations.
+## 4. UI misalignment / clipped text fixed
+The clipped sidebar text, cut-off "START SCAN & ANALYZE" button, and the
+garbled "Scan progress: 1009" you saw are classic symptoms of a Windows
+high-DPI scaling mismatch in Tk apps. Fixed by:
+- Declaring proper DPI awareness on Windows before any window is created
+  (`SetProcessDpiAwareness`), so Tk measures text against the OS's real
+  scaling factor instead of guessing.
+- Widened the sidebar and locked its width (`grid_propagate(False)`) so its
+  text can't get compressed.
+- Gave the scan button a fixed minimum width and moved the mode radio
+  buttons into their own sub-frame so they shrink instead of squeezing the
+  button off-screen at narrower widths.
+- Added `wraplength` to the analysis/status labels so long messages wrap
+  instead of overflowing and overlapping neighboring widgets.
 
-## 2. Theme switching not applying
-**Cause:** every color in `gui.py` was a hardcoded hex string, so
-`ctk.set_appearance_mode()` had no visible effect on the UI.
+## 5. Responsiveness / lag fixed
+Progress-callback UI updates are now **time-throttled** (max ~8 updates/sec)
+instead of firing on every batch of files. On a fast scan over many small
+files, the old code could queue hundreds of widget updates per second onto
+the Tk event loop, which is what caused the stutter/lag during scanning.
 
-**Fix:** added a real `apply_theme()` in `gui.py` that walks the live widget
-tree and swaps each *matching* palette color for its Dark/Light equivalent.
-Layout, structure, and every widget stay exactly where they were — only the
-surface/text tones change. Status colors (red/green/amber badges) and the
-brand accent are intentionally kept constant across both themes.
+## 6. Scan History page redesigned
+Replaced the flat text-dump with a scrollable list of styled cards — one per
+scan/cleanup event, each showing a type icon, a colored status badge
+(Completed/In Progress/Stopped/Files Cleaned), the target path, timestamp,
+and (for cleanups) files removed + space freed.
 
-## 3. Static / placeholder UI elements made real
-- Dashboard **Health Score** was a fixed `82 / 100` — now computed live from
-  real CPU/RAM/storage usage (`psutil`, via `core/system_monitor.py`, which
-  was already real).
-- Dashboard **Storage Analysis Summary** never updated after a scan — it now
-  reflects the actual last scan's results.
-- The scan progress bar was a fake time-based animation — it's now driven by
-  the scanner's real discover/pre-filter/hash stage progress.
-- Removed a dead, unused code path (`run_duplicate_scanner`).
-
-## Not changed
-- Overall layout, page structure, navigation, and visual design are
-  untouched, as requested — only the bugs above were fixed and the theme
-  colors now actually apply.
-- `lapdoctor_cache.db` was removed from this package because it contained an
-  orphaned, unused table left over from earlier testing; the app recreates a
-  fresh one automatically on first run.
+## Verified
+All of the above was tested end-to-end in a headless X server (real
+`mainloop()`, not simulated): scans run, per-mode consoles populate
+correctly and independently, history cards render, Settings toggles work,
+and no thread-safety errors occur. Screenshots were also captured to confirm
+no clipped/overlapping text.
