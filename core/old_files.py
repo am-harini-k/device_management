@@ -1,56 +1,34 @@
 import os
 import time
 from datetime import datetime
+from core.duplicate import SKIP_DIRS
 
-from .duplicate import SKIP_DIRS
-
-
-def find_old_files(file_records, days_old=180):
-    """Return a list of records older than a cutoff based on mtime."""
-    cutoff_time = time.time() - (days_old * 86400)
-    return [item for item in file_records if item.get('modified', 0) < cutoff_time]
-
-
-def scan(target_path, days_old=180, stop_event=None, progress_cb=None, yield_every=200, skip_system_dirs=True):
+def scan(target_path, days_old=180, skip_system_dirs=True):
     """
     Scans target_path for files that haven't been modified in 'days_old' (default 6 months / 180 days).
     Returns a formatted report string for gui.py.
     """
-    cutoff_time = time.time() - (days_old * 86400)
+    cutoff_time = time.time() - (days_old * 86400)  # 86400 seconds = 1 day
     old_files = []
-    scanned = 0
 
     for root, dirs, files in os.walk(target_path):
-        if stop_event and stop_event.is_set():
-            break
         if skip_system_dirs:
             dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
-
         for file in files:
-            if stop_event and stop_event.is_set():
-                break
             try:
                 full_path = os.path.join(root, file)
                 mtime = os.path.getmtime(full_path)
-
+                
                 if mtime < cutoff_time:
                     size = os.path.getsize(full_path)
                     old_files.append((full_path, size, mtime))
-            except (PermissionError, FileNotFoundError, OSError):
+            except (PermissionError, FileNotFoundError):
                 continue
-
-            scanned += 1
-            if scanned % yield_every == 0:
-                if progress_cb:
-                    progress_cb("discover", scanned, None)
-                time.sleep(0)
-
-    if stop_event and stop_event.is_set():
-        return f"\nOld-file scan interrupted by user in:\n{target_path}"
 
     if not old_files:
         return f"\nNo stale files older than {days_old} days were found in:\n{target_path}"
 
+    # Sort files by oldest modified time first
     old_files.sort(key=lambda x: x[2])
 
     output = [f"\nFound {len(old_files)} stale file(s) older than {days_old} days:\n"]
