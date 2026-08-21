@@ -1,0 +1,8 @@
+# Runtime dependencies
+customtkinter>=5.2.0
+psutil>=5.9.0
+send2trash>=1.8.0
+google-genai>=1.0.0
+
+# Dev/test dependency (not needed to just run the app)
+pytest>=8.0.0
